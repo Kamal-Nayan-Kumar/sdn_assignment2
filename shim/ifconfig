@@ -1,0 +1,33 @@
+#!/bin/bash
+# ifconfig shim: translates the ifconfig invocations used by Mininet
+# into `ip` commands (this system has iproute2 but no net-tools).
+#
+# Supported forms:
+#   ifconfig <iface>                    -> ip addr show <iface>
+#   ifconfig <iface> up|down            -> ip link set <iface> up|down
+#   ifconfig <iface> hw ether <mac>     -> ip link set <iface> address <mac>
+#   ifconfig <iface> <ip>/<prefix> up   -> ip addr add ... ; ip link set up
+
+iface="$1"; shift || true
+
+case "$1" in
+  "")
+    exec ip addr show "$iface"
+    ;;
+  up)
+    exec ip link set "$iface" up
+    ;;
+  down)
+    exec ip link set "$iface" down
+    ;;
+  hw)
+    # ifconfig <iface> hw ether <mac>
+    mac="$3"
+    exec ip link set "$iface" address "$mac"
+    ;;
+  *)
+    # ifconfig <iface> <ip>/<prefix> up
+    ipaddr="$1"
+    exec sh -c "ip addr add '$ipaddr' dev '$iface' 2>/dev/null; ip link set '$iface' up"
+    ;;
+esac
