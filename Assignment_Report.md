@@ -104,21 +104,54 @@ STATUS:
 - oswitch.py FEATURES_REPLY struct packing bugs fixed
 - intent_to_policy.py built with deterministic + LLM parsing
 - Policy file correctly written and loadable by POX firewall
+- END-TO-END MININET NOW WORKS (see fixes below)
 
-BLOCKER: End-to-end Mininet ping test (100% dropped)
-- Root cause: unshare -Urn creates separate network namespace;
-  veth pair creation requires capabilities not available without sudo
-- oswitch cannot reach controller (127.0.0.1:6633) from within namespace
-- Workaround: POX runs outside namespace; oswitch inside namespace cannot connect
+END-TO-END RESULT (measured, not assumed):
+  h1->h2=PASS  h1->h3=FAIL  h1->h4=PASS
+  h2->h1=PASS  h2->h3=PASS  h2->h4=FAIL
+  h3->h1=FAIL  h3->h2=PASS  h3->h4=PASS
+  h4->h1=PASS  h4->h2=FAIL  h4->h3=PASS
+  => 8/12 pass, 4 fail = 33% dropped
+
+Note on the reverse direction (h3->h1, h4->h2):
+  These fail as a *consequence* of the DROP rules, not independently.
+  Blocking h1->h3 also drops h1's ARP replies to h3, so h3 can never
+  resolve h1's MAC (`ip neigh` stays INCOMPLETE) and the ping cannot be
+  sent. This is inherent to a strict L2 MAC-pair firewall: a one-way
+  MAC-pair drop implies an unusable ARP path in the blocked direction.
+  Letting ARP through would fix the reverse pings but weakens the policy.
+
+BLOCKERS FIXED to get end-to-end working (all were real defects):
+1. mnexec was never built. `make mnexec` reported "up to date" due to a
+   stale timestamp while the binary did not exist; Mininet then hung
+   spawning node shells. Fix: rm + make mnexec.
+2. POX module path is `firewall`, not `pox.ext.firewall` — boot.py adds
+   ext/ to sys.path itself, and upstream ext/ lives outside the package.
+3. FEATURES_REPLY body packed 21 bytes (!QBB3sII) vs POX's 24 (!QLB).
+   n_buffers is 4 bytes (L), not 1 byte (B). This is what produced the
+   AssertionError in libopenflow_01._readzs().
+4. STATS_REPLY for OFPST_DESC must echo a 1056-byte descriptor block
+   before the 4-byte stats header, else UnderrunError.
+5. FLOW_MOD match was 36 bytes; POX's ofp_match is 40 (two pad fields).
+   Command section is !QHHHHLHH (24 bytes), not !IHHHHHIHH.
+6. oswitch bound AF_PACKET sockets with protocol 0x0003 instead of
+   socket.htons(0x0003). The unconverted value silently yields a socket
+   that NEVER RECEIVES — this was the true cause of "100% dropped".
+7. Mininet may leave veth ports down when the switch starts; oswitch now
+   runs `ip link set <iface> up` before binding, else recv() gives ENETDOWN.
+8. A dead port socket killed the whole switch; it now drops just that port.
+
+Environment notes:
+- No sudo available; everything runs under `unshare -Urn`.
+- ICMP works fine inside the namespace (verified with a plain 2-host link),
+  so the namespace was never the blocker.
+- Run: `unshare -Urn bash run_e2e.sh`
 
 NEXT STEPS:
-1. Kill any stale oswitch processes before re-running end-to-end tests
-2. If assertion still fails, add debug output to oswitch.py to hex-dump FEATURES_REPLY
-3. Once switch connects cleanly, verify ping results:
-   - h1↔h3 and h2↔h4 should fail (DROP rules)
-   - All other pairs should pass (learning-switch forwarding)
-4. Part 2 is complete — intent_to_policy.py ready for Phi-3/Llama integration
-5. Optional: Create assignment screenshots and written report
+1. Decide whether reverse-direction pings (h3->h1, h4->h2) must pass.
+   If yes, the firewall needs an ARP exemption or L3-aware matching.
+2. Capture Mininet CLI ping screenshots (the report still needs them).
+3. Write up the assignment summary/challenges section.
 
 ================================================================
 ASSIGNMENT CHECKLIST

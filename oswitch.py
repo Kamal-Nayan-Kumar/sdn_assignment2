@@ -23,6 +23,7 @@ import os
 import select
 import signal
 import socket
+import subprocess
 import struct
 import sys
 import time
@@ -51,6 +52,9 @@ OFPT_STATS_REPLY = 17
 OFPT_BARRIER_REQUEST = 18
 OFPT_BARRIER_REPLY = 19
 
+# OFPST_DESC descriptor block: 4x256-byte strings + 32-byte serial.
+DESC_LEN = 4 * 256 + 32
+
 OFPFC_ADD = 0
 OFPFC_MODIFY = 1
 OFPFC_DELETE = 2
@@ -64,8 +68,17 @@ OFPP_CONTROLLER = 0xfffd
 #   wildcards(4) in_port(2) dl_src(6) dl_dst(6) dl_vlan(2) dl_vlan_pcp(1)
 #   pad(1) dl_type(2) nw_tos(1) nw_proto(1) pad(2) nw_src(4) nw_dst(4)
 #   tp_src(2) tp_dst(2)
-OFP_MATCH_FMT = '!IH6s6sHBBHIIHH'
+#   tp_src(2) tp_dst(2)
+# The match field carries two alignment pads (after dl_vlan_pcp and after
+# nw_proto), giving the full 40-byte ofp_match that POX packs.
+OFP_MATCH_FMT = '!IH6s6sHBxHBB2xIIHH'
 OFP_MATCH_SZ = struct.calcsize(OFP_MATCH_FMT)
+
+# FLOW_MOD command section that follows the match:
+#   cookie(8) command(2) idle_timeout(2) hard_timeout(2) priority(2)
+#   buffer_id(4) out_port(2) flags(2) = 24 bytes
+OFP_FLOW_MOD_FMT = '!QHHHHLHH'
+OFP_FLOW_MOD_SZ = struct.calcsize(OFP_FLOW_MOD_FMT)
 
 # Flow mod body after 8-byte header:
 #   match(40) cookie(8) command(2) idle(2) hard(2) priority(2)
@@ -111,6 +124,7 @@ class OFSwitch:
         self.xid = 1
         self.next_buffer_id = 1
         self.buffers = {}     # buffer_id -> (port_num, frame)
+        self.dead_ports = set()  # ports whose socket errored out
         self.ctrl = None
 
         for port_num, iface in ports:
@@ -133,9 +147,20 @@ class OFSwitch:
         self.xid += 1
 
     def open_ports(self):
-        """Open raw sockets on all data ports."""
+        """Open raw sockets on all data ports.
+
+        Mininet creates the veth pairs but may leave them administratively
+        down when the switch process starts, so bring each interface up
+        first; otherwise recv() fails with ENETDOWN and no frames are ever
+        read.
+        """
         for port_num, iface in self.ports.items():
-            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0x0003)
+            subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                           capture_output=True)
+            # The protocol must be in network byte order; passing a bare
+            # ETH_P_ALL silently yields a socket that never receives.
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                              socket.htons(0x0003))
             s.bind((iface, 0))
             s.setblocking(False)
             self.socks[port_num] = s
@@ -156,9 +181,10 @@ class OFSwitch:
 
     def handle_features_request(self, xid):
         """Reply to FEATURES_REQUEST with FEATURES_REPLY."""
-        # OpenFlow 1.0 FEATURES_REPLY body:
-        #   datapath_id(8) n_buffers(1) n_tables(1) pad(3) capabilities(4) actions(4)
-        body = struct.pack('!QBB3sII', self.dpid, 255, 1, b'\x00' * 3, 0, 0)
+        # OpenFlow 1.0 FEATURES_REPLY body (fixed 24-byte header):
+        #   datapath_id(8) n_buffers(4) n_tables(1) pad(3) capabilities(4) actions(4)
+        # n_buffers is 4 bytes (L), not 1 byte (B).
+        body = struct.pack('!QLB3sII', self.dpid, 255, 1, b'\x00' * 3, 0, 0)
         for port_num in sorted(self.ports.keys()):
             iface = self.ports[port_num]
             # OpenFlow 1.0 phy_port: port_no(2) hw_addr(6) name(16)
@@ -183,7 +209,8 @@ class OFSwitch:
 
         (cookie, command, idle_timeout, hard_timeout, priority,
          buffer_id, out_port, flags) = \
-            struct.unpack('!IHHHHHIHH', data[OFP_MATCH_SZ:OFP_MATCH_SZ + 24])
+            struct.unpack(OFP_FLOW_MOD_FMT,
+                          data[OFP_MATCH_SZ:OFP_MATCH_SZ + OFP_FLOW_MOD_SZ])
 
         match = {
             'in_port': in_port, 'dl_src': dl_src, 'dl_dst': dl_dst,
@@ -193,7 +220,7 @@ class OFSwitch:
         }
 
         actions = []
-        action_data = data[OFP_MATCH_SZ + 24:]
+        action_data = data[OFP_MATCH_SZ + OFP_FLOW_MOD_SZ:]
         offset = 0
         while offset + 4 <= len(action_data):
             act_type, act_len = struct.unpack('!HH', action_data[offset:offset + 4])
@@ -259,6 +286,7 @@ class OFSwitch:
 
     def handle_packet_in(self, port_num, frame):
         """Handle a frame received on a port."""
+        self.log('PacketIn on port %d (%d bytes)' % (port_num, len(frame)))
         for flow in sorted(self.flow_table, key=lambda f: -f.priority):
             if flow.matches(port_num, frame):
                 if flow.actions:
@@ -281,8 +309,17 @@ class OFSwitch:
         self.xid += 1
 
     def handle_stats_request(self, xid, data):
-        """Reply to STATS_REQUEST with empty STATS_REPLY."""
-        body = struct.pack('!HH', 0, 0)
+        """Reply to STATS_REQUEST with a STATS_REPLY.
+
+        OFPT_STATS_REPLY for OFPST_DESC must echo the 1056-byte
+        manufacturer/hardware/software/serial/datapath descriptor block
+        ahead of the 4-byte stats header, or POX raises UnderrunError.
+        """
+        # The request body carries the stats type followed by the desc block.
+        desc = data[4:] if len(data) >= 4 else b''
+        if len(desc) < DESC_LEN:
+            desc = desc.ljust(DESC_LEN, b'\x00')
+        body = desc[:DESC_LEN] + struct.pack('!HH', 0, 0)
         length = 8 + len(body)
         header = struct.pack('!BBHI', OFP_VERSION, OFPT_STATS_REPLY, length, xid)
         self.ctrl.send(header + body)
@@ -329,7 +366,9 @@ class OFSwitch:
         while True:
             try:
                 readable, _, _ = select.select(
-                    [self.ctrl] + list(self.socks.values()), [], [], 1.0)
+                    [self.ctrl] + [s for pn, s in self.socks.items()
+                                   if pn not in self.dead_ports],
+                    [], [], 1.0)
             except (ValueError, OSError):
                 break
 
@@ -349,6 +388,14 @@ class OFSwitch:
                             try:
                                 frame = s.recv(65535)
                             except BlockingIOError:
+                                continue
+                            except OSError as e:
+                                # The port went away (teardown / link down).
+                                # Drop the dead socket instead of killing the
+                                # whole switch, otherwise the data plane dies
+                                # with the control plane.
+                                self.log('Port %d recv error: %s' % (pn, e))
+                                self.dead_ports.add(pn)
                                 continue
                             if frame:
                                 self.handle_packet_in(pn, frame)
