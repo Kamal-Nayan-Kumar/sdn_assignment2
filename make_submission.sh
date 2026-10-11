@@ -62,6 +62,7 @@ FILES=(
   tests/test_intent_to_policy.py
 
   # --- policy and config ---------------------------------------------
+  README.md
   COMMAND.md
   firewall_rules.rules
   mise.toml
@@ -91,68 +92,6 @@ done
 # ------------------------------------------------------------------ #
 # README: how to run it                                              #
 # ------------------------------------------------------------------ #
-cat > "$STAGE/README.md" <<'EOF'
-# SDN Assignment 2 — Layer-2 Firewall & Intent-Based Networking
-
-**Everything you need is in `report/report.pdf`** — the architecture,
-implementation details, environment setup, known limitations, results, and
-all screenshots.
-
-## What is here
-
-| Path | What it is |
-|---|---|
-| `report/report.pdf` | **The report. Start here.** |
-| `report/report.tex`, `report/figs/` | LaTeX source and every screenshot |
-| `app/firewall.py` | **The POX firewall application** (the main deliverable) |
-| `pox/ext/firewall.py` | A copy, already where POX expects it |
-| `oswitch.py` | Pure-Python OpenFlow 1.0 switch |
-| `topo2.py` | Four-host Mininet topology |
-| `intent_to_policy.py` | Natural-language → policy (qwen2.5:0.5b via Ollama) |
-| `firewall_rules.rules` | The generated policy (h1→h3, h2→h4 DROP) |
-| `tests/` | 51 offline tests |
-| `SDN_Assignment2 2026.pdf` | The assignment statement |
-
-## Running it
-
-`pox/` and `mininet/` are third-party checkouts and are **not** included.
-The code needs them on disk, but no network is required to read this.
-
-```bash
-# 1. Offline tests — no network, no LLM, ~1s
-python3 -m pytest tests/ -q          # expect: 51 passed
-
-# 2. Full end-to-end bring-up (POX + oswitch + Mininet)
-bash run_e2e.sh --batch               # scripted: pingall + per-pair pings
-bash run_e2e.sh                       # or interactive (drops into the CLI)
-
-# 3. Part 2: natural-language intent → policy file
-#    needs `ollama serve` and `ollama pull qwen2.5:0.5b`
-python3 intent_to_policy.py \
-    "Block h1 from sending traffic to h3." \
-    "Block h2 from sending traffic to h4." \
-    "Allow everything else." -f json
-
-# 4. Rebuild the report
-bash report/build.sh                  # tectonic or pdflatex
-bash report/capture.sh                # regenerate every screenshot
-```
-
-All network commands must run inside a user namespace, because the target
-machine has no `sudo`:
-
-```bash
-unshare -Urn bash run_e2e.sh --batch
-```
-
-## Expected result
-
-`pingall` reports **33% dropped (8/12)**: the two prohibited pairs
-(`h1→h3`, `h2→h4`) and their reverse directions. The reverse directions fail
-as a consequence of ARP — the report explains why, and why that is the
-correct reading of the assignment rather than a bug.
-EOF
-
 cat > "$STAGE/run_all.sh" <<'EOF'
 #!/usr/bin/env bash
 # Run every check in the submission, in order.
