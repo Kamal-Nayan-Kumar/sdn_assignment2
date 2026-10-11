@@ -62,6 +62,7 @@ FILES=(
   tests/test_intent_to_policy.py
 
   # --- policy and config ---------------------------------------------
+  COMMAND.md
   firewall_rules.rules
   mise.toml
   .gitignore
