@@ -16,7 +16,7 @@ Deliverables:
 - firewall_rules.rules ................ Policy: h1→h3 DROP, h2→h4 DROP
 - topo2.py ............................ Mininet topology (4 hosts, 1 switch, fixed MACs)
 - oswitch.py .......................... Minimal Python OpenFlow 1.0 switch
-- tests/test_firewall.py .............. 7 offline tests
+- tests/test_firewall.py .............. 11 offline tests
 - tests/test_oswitch_wire.py .......... 9 OpenFlow wire-format tests
 - run_e2e.sh ........................... Brings up the full stack
 - report/mininet_cli.txt .............. Scripted Mininet CLI checks
@@ -99,6 +99,11 @@ tests/test_firewall.py (7):
   test_blocked_frames_are_dropped ................... PASSED
   test_allowed_traffic_is_learned_and_forwarded ..... PASSED
   test_allowed_traffic_between_blocked_pairs_neighbours ... PASSED
+  test_policy_applies_to_arp_too ..................... PASSED
+  test_is_blocked_ignores_protocol .................. PASSED
+  test_drop_flow_entry_is_not_scoped_by_ethertype ... PASSED
+  test_reverse_direction_is_unreachable_but_unnamed . PASSED
+  test_proactive_drops_are_always_installed ......... PASSED
 
 tests/test_oswitch_wire.py (9):
   test_fixed_struct_sizes_match_spec ................ PASSED
@@ -111,7 +116,7 @@ tests/test_oswitch_wire.py (9):
   test_exact_mac_match ............................. PASSED
   test_wildcarded_fields_are_not_compared ........... PASSED
 
-tests/test_intent_to_policy.py (32):
+tests/test_intent_to_policy.py (31):
   validate_rules / merge_rules / llm_parse / guards ... 32 PASSED
 
 ================================================================
@@ -120,7 +125,7 @@ PART 2: Intent-based Networking
 
 Deliverable:
 - intent_to_policy.py .................... LLM intent parser
-- tests/test_intent_to_policy.py ........ 32 tests
+- tests/test_intent_to_policy.py ........ 31 tests
 
 The script converts natural language intent into POX-compatible firewall rules.
 Parsing is done by the LLM only; an unreachable or unusable LLM causes a
@@ -155,13 +160,13 @@ Current Policy File (after running intent_to_policy.py):
 STATUS & RESULTS
 ================================================================
 
-- All 48 offline tests pass (firewall logic + wire format + LLM handling)
+- All 51 offline tests pass (firewall logic + wire format + LLM handling)
 - oswitch.py struct-packing bugs fixed (FEATURES_REPLY, FLOW_MOD cookie,
   STATS_REPLY, ofp_match, wildcard bits)
 - intent_to_policy.py built with LLM-based parsing, fail-closed guards
 - Policy file correctly written and loadable by the POX firewall
 
-END-TO-END RESULT (measured, not assumed; 6/6 runs identical):
+END-TO-END RESULT (measured, not assumed; identical across runs):
   h1->h2=PASS  h1->h3=FAIL  h1->h4=PASS
   h2->h1=PASS  h2->h3=PASS  h2->h4=FAIL
   h3->h1=FAIL  h3->h2=PASS  h3->h4=PASS
@@ -170,11 +175,40 @@ END-TO-END RESULT (measured, not assumed; 6/6 runs identical):
 
 Note on the reverse direction (h3->h1, h4->h2):
   These fail as a *consequence* of the DROP rules, not independently.
-  Blocking h1->h3 also drops h1's ARP replies to h3, so h3 can never
-  resolve h1's MAC (`ip neigh` stays INCOMPLETE) and the ping cannot be
-  sent. This is inherent to a strict L2 MAC-pair firewall: a one-way
-  MAC-pair drop implies an unusable ARP path in the blocked direction.
-  Letting ARP through would fix the reverse pings but weakens the policy.
+  No rule names h3->h1 — is_blocked(h3, h1) is False. Blocking h1->h3
+  discards h1's ARP replies to h3, because an ARP frame is an Ethernet
+  frame from h1 to h3 and the rule matches on MAC pairs alone. h3 can
+  therefore never resolve h1's MAC, so the neighbour entry stays
+  INCOMPLETE and the echo request is never sent. The run shows this
+  directly: the pings fail with "Destination Host Unreachable", which is
+  an ARP failure rather than a policy block.
+
+  Independently, an ICMP echo *reply* is itself a frame from h1 to h3, so
+  it is dropped by the same rule even with ARP resolved. A one-way
+  MAC-pair drop therefore yields a *symmetric* blackout, and 33% rather
+  than 17% is the honest number.
+
+Deviation implemented, measured, and reverted:
+  Exempting ARP and letting ICMP echo replies through does produce 10/12
+  (only h1->h3 and h2->h4 fail; both reverse directions pass). It was not
+  shipped, for two reasons:
+
+    1. OpenFlow 1.0's ofp_match has no ICMP-type field, so no flow entry
+       can distinguish a reply from a request. Letting replies through
+       requires dropping the proactive flow entries and deciding every
+       packet in the controller — which contradicts the assignment's
+       requirement to "install the corresponding drop rules proactively
+       in the switch".
+    2. The relaxation produced a real policy bypass. A flow entry matches
+       on MACs alone, so caching a forwarding decision for (h1,h3) while
+       forwarding an echo reply also let h1's echo *request* through
+       uninspected. pingall reported the pair as blocked while a direct
+       `h1 ping h3` in the same session succeeded.
+
+  The literal reading is what ships: drop every frame matching a
+  prohibited pair. tests/test_firewall.py pins this down, including an
+  assertion that is_blocked() still takes only (src, dst), so the scope
+  cannot be widened by accident.
 
 pingall stability:
   Deterministic once the FEATURES_REPLY bug was fixed. Six consecutive runs
@@ -202,7 +236,7 @@ ASSIGNMENT CHECKLIST
   [✓] Policy file with src/dst MAC pairs (h1→h3 DROP, h2→h4 DROP)
   [✓] Proactive DROP flow installation on ConnectionUp
   [✓] Learning-switch for allowed traffic forwarding
-  [✓] All offline tests passing (48 total)
+  [✓] All offline tests passing (51 total)
 
 [✓] Part 2: Intent-based networking
   [✓] LLM integration (fails loudly if LLM unreachable)

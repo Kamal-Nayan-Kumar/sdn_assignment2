@@ -173,45 +173,73 @@ def test_blocked_frames_are_dropped():
   assert len(conn.sent) == before, "blocked frame must not be forwarded"
 
 
-def test_allowed_traffic_is_learned_and_forwarded():
+# ---------------------------------------------------------------------- #
+# Strict scope: the policy applies to EVERY frame for the pair         #
+# ---------------------------------------------------------------------- #
+
+def test_policy_applies_to_arp_too():
+  """No ARP exemption.
+
+  The assignment says to drop *frames* matching a prohibited MAC pair.
+  ARP frames are frames, so h1's ARP reply to h3 is dropped like any other
+  traffic.  Exempting ARP would make h3->h1 reachable and yield 10/12, but
+  it would also mean the firewall does not do what it was told to do.
+  """
   fw = make_firewall()
   conn = FakeConnection(dpid=1)
   fw._handle_ConnectionUp(FakeEvent(conn, dpid=1))
 
-  # h1 -> h2, controller doesn't know where h2 is yet => flood
-  pkt = make_packet(H1, H2)
-  fw._handle_PacketIn(FakeEvent(conn, dpid=1, port=1, parsed=pkt))
-  assert len(conn.packet_outs) == 1
-  assert conn.packet_outs[0].actions[0].port == of.OFPP_FLOOD
-  assert fw.mac_to_port[1][EthAddr(H1)] == 1
-
-  # h2 -> h1 : now h1 is known on port 1 => forward + install flow
-  pkt = make_packet(H2, H1)
-  fw._handle_PacketIn(FakeEvent(conn, dpid=1, port=2, parsed=pkt))
-  assert fw.mac_to_port[1][EthAddr(H2)] == 2
-
-  outs = conn.packet_outs
-  assert len(outs) == 2
-  assert outs[1].actions[0].port == 1, "packet must go out port 1"
-
-  fwd = [m for m in conn.flow_mods if len(m.actions) > 0]
-  assert len(fwd) == 1, "expected one forwarding flow entry"
-  assert str(fwd[0].match.dl_src) == H2
-  assert str(fwd[0].match.dl_dst) == H1
-  assert fwd[0].actions[0].port == 1
+  arp = make_packet(H1, H3, ethertype=ethernet.ARP_TYPE)
+  fw._handle_PacketIn(FakeEvent(conn, dpid=1, port=1, parsed=arp))
+  assert conn.packet_outs == [], \
+      "ARP from a prohibited pair must be dropped like any other frame"
 
 
-def test_allowed_traffic_between_blocked_pairs_neighbours():
-  """h1->h2, h3->h4 etc. must all work (only 2 pairs are blocked)."""
+def test_is_blocked_ignores_protocol():
+  """is_blocked() is a pure MAC-pair lookup: no ethertype argument exists.
+
+  This is the contract that makes the behaviour above deliberate rather
+  than accidental -- if a protocol parameter is ever reintroduced, this
+  signature is what breaks.
+  """
+  import inspect
+  params = list(inspect.signature(
+      __import__('ext.firewall', fromlist=['Firewall'])
+      .Firewall.is_blocked).parameters)
+  assert params == ['self', 'src_mac', 'dst_mac'], \
+      "is_blocked() must stay a pure (src,dst) MAC-pair test"
+
+
+def test_drop_flow_entry_is_not_scoped_by_ethertype():
+  """The proactive entry must match the pair regardless of protocol."""
   fw = make_firewall()
   conn = FakeConnection(dpid=1)
   fw._handle_ConnectionUp(FakeEvent(conn, dpid=1))
 
-  for src, dst in [(H1, H2), (H1, H4), (H3, H1), (H3, H2), (H3, H4)]:
-    pkt = make_packet(src, dst)
-    fw._handle_PacketIn(FakeEvent(conn, dpid=1, port=1, parsed=pkt))
-    assert len(conn.packet_outs) >= 1
-    conn.packet_outs.clear()
+  drops = conn.flow_mods
+  assert len(drops) == 2, "one proactive DROP entry per rule"
+  for m in drops:
+    assert not m.match.dl_type, \
+        "the match must not be narrowed by dl_type, or ARP escapes the rule"
+    assert len(m.actions) == 0, "an empty action list means drop"
 
-  assert not fw.is_blocked(H1, H2)
-  assert not fw.is_blocked(H3, H4)
+
+def test_reverse_direction_is_unreachable_but_unnamed():
+  """h3->h1 is not in the policy; it fails only as a downstream effect.
+
+  Blocking h1->h3 discards h1's ARP replies, so h3 never resolves h1's MAC.
+  The firewall forwards every h3->h1 frame it is offered; there is simply no
+  traffic, because ARP never completed.
+  """
+  fw = make_firewall()
+  assert fw.is_blocked(H3, H1) is False, \
+      "no rule names h3->h1; the reverse failure is an ARP consequence"
+  assert fw.is_blocked(H1, H3) is True
+
+
+def test_proactive_drops_are_always_installed():
+  """The assignment requires proactive installation on ConnectionUp."""
+  fw = make_firewall()
+  conn = FakeConnection(dpid=1)
+  fw._handle_ConnectionUp(FakeEvent(conn, dpid=1))
+  assert len(conn.flow_mods) == 2

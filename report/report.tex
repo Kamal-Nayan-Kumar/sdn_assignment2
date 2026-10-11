@@ -449,6 +449,18 @@ pass even while the live network is unreliable.}
 \code{test\_allowed\_traffic\_between\_blocked\_pairs\_neighbours}
   & All five unblocked pairs still forward
   & \textcolor{passgreen}{PASS} \\
+\code{test\_policy\_applies\_to\_arp\_too}
+  & ARP from a prohibited pair is dropped like any other frame
+  & \textcolor{passgreen}{PASS} \\
+\code{test\_is\_blocked\_ignores\_protocol}
+  & \code{is\_blocked()} takes only \code{(src,dst)} --- scope is pinned
+  & \textcolor{passgreen}{PASS} \\
+\code{test\_drop\_flow\_entry\_is\_not\_scoped\_by\_ethertype}
+  & The proactive entry matches the pair regardless of protocol
+  & \textcolor{passgreen}{PASS} \\
+\code{test\_proactive\_drops\_are\_always\_installed}
+  & Proactive installation on \code{ConnectionUp}, as the assignment requires
+  & \textcolor{passgreen}{PASS} \\
 \code{test\_policy\_file\_loads\_json\_format}
   & The live policy file on disk (LLM output) loads
   & \textcolor{passgreen}{PASS} \\
@@ -508,7 +520,7 @@ pass even while the live network is unreliable.}
 \endgroup
 
 \noindent
-All 48 tests pass. The two new files deserve a word, because each covers
+All 51 tests pass. The two new files deserve a word, because each covers
 something that cannot be checked by looking at \code{pingall} output. The
 wire format is asserted against POX's \emph{own} message classes rather than
 hand-copied constants, so the test fails if either side drifts. The LLM
@@ -570,18 +582,59 @@ residual flakiness, and the hypothesised idle-timeout fix was never needed.
 
 \subsubsection*{Why the reverse direction also fails}
 
-\code{h3$\rightarrow$h1} fails, but \emph{not} because a rule blocks it --- the
-policy contains no such rule. It fails as a downstream consequence. Blocking
-\code{h1$\rightarrow$h3} discards \code{h1}'s ARP replies to \code{h3}, so
-\code{h3} can never resolve \code{h1}'s MAC address: \code{ip neigh} stays
-\code{INCOMPLETE} and the ICMP echo request is never actually sent.
+\code{h3$\rightarrow$h1} fails, but \emph{not} because a rule blocks it ---
+the policy contains no such rule, and \code{is\_blocked(h3, h1)} is
+\code{False}. It fails as a downstream consequence.
 
-This is inherent to a strict Layer-2 MAC-pair firewall. ARP is carried as
-Ethernet traffic, so it is subject to the same rule as everything else. The
-alternatives --- exempting ARP from the policy, or making the firewall
-Layer-3-aware --- both weaken the guarantee that the assignment asks for, so
-the symmetric behaviour is the correct one here. The asymmetry is a property
-of ARP, not a bug in the rule set.
+Blocking \code{h1$\rightarrow$h3} discards \code{h1}'s ARP replies to
+\code{h3}, because an ARP frame is an Ethernet frame from \code{h1} to
+\code{h3} and the rule matches on MAC pairs alone. \code{h3} can therefore
+never resolve \code{h1}'s MAC: the neighbour entry stays \code{INCOMPLETE}
+and the ICMP echo request is never sent. The Mininet run shows this
+directly --- the pings fail with \emph{Destination Host Unreachable} rather
+than silently timing out, which is an ARP failure, not a policy block:
+
+\begin{lstlisting}[style=sdnconsole]
+h3 ping -c 2 h1
+From 10.0.0.3 icmp_seq=1 Destination Host Unreachable
+\end{lstlisting}
+
+A second, independent effect points the same way. An ICMP echo \emph{reply}
+is itself a frame from \code{h1} to \code{h3}, so even with ARP resolved it
+would be dropped by the same rule. A one-way MAC-pair drop therefore produces
+a \emph{symmetric} traffic blackout, and \code{33\%} rather than
+\code{17\%} is the honest number.
+
+\subsubsection*{A deviation that was implemented, measured, and reverted}
+
+An earlier revision of this project exempted ARP and let ICMP echo replies
+through, which does yield \code{10/12} --- only \code{h1$\rightarrow$h3} and
+\code{h2$\rightarrow$h4} fail, and both reverse directions pass. It is worth
+recording why that was \emph{not} shipped.
+
+OpenFlow 1.0's \code{ofp\_match} has no field for the ICMP type. Distinguishing
+an echo request from an echo reply is therefore impossible in a flow entry,
+so a proactive drop installed for \code{(h1,h3)} necessarily discards the
+replies too. The only way to let a reply through is to stop installing a
+proactive entry for that pair and decide every packet in the controller
+instead --- which directly contradicts the assignment's requirement that the
+controller \emph{``install the corresponding drop rules proactively in the
+switch''}.
+
+Worse, the relaxation produced a subtle and dangerous failure. Because a flow
+entry matches on MACs only, caching a forwarding decision for \code{(h1,h3)}
+while forwarding an echo reply also let \code{h1}'s echo \emph{request}
+through uninspected. \code{pingall} reported the pair as blocked while a
+direct \code{h1 ping h3} in the same session succeeded --- the policy was
+being bypassed on exactly the pair it was written to protect.
+
+The literal reading is therefore what ships. The literal reading is also the
+one that can be defended: the firewall drops every frame matching a
+prohibited pair, which is what it was asked to do, and the symmetric
+blackout is a property of MAC-pair filtering rather than a defect in the rule
+set. Tests in \code{test\_firewall.py} pin this down, including one asserting
+that \code{is\_blocked()} still takes only \code{(src, dst)} --- so the
+scope cannot be widened by accident later.
 
 \shot{dptable}{0.94}{Flow entries actually installed in the switch. The two
 priority-100 entries are the proactive DROP rules installed at
@@ -801,9 +854,11 @@ the target and rebuilding fixed it.
         ever removes rules; it never introduces one the administrator's text
         does not support. This is what makes a 0.5\,B model acceptable on a
         security path.
-  \item \textbf{Arp left subject to policy.} Permitting ARP would make the
-        reverse pings pass and would look like a better result, but it would
-        mean the firewall no longer blocks the pair it was told to block.
+  \item \textbf{ARP and ICMP left subject to the policy.} Exempting either
+        would make the reverse pings pass and produce a better-looking
+        \code{10/12}, but the firewall would then not drop every frame
+        matching a prohibited pair, which is what the assignment specifies.
+        Measured, and reverted --- see Section 3.4.3.
   \item \textbf{Smallest adequate model.} A 0.5\,B model was chosen over the
         3.8\,B one named in the assignment, because the guards above make
         correctness independent of model size while latency depends on it
@@ -834,6 +889,11 @@ the target and rebuilding fixed it.
         a way that does not literally contain \qtwodot \code{h1} cannot be
         cross-checked. It errs toward keeping the rule rather than silently
         dropping a requested one.
+  \item \textbf{A MAC-pair rule is symmetric in practice.} Blocking one
+        direction also removes the reverse direction's connectivity, because
+        ARP and ICMP replies travel over the blocked pair. An operator
+        wanting true one-way reachability needs Layer-3 or Layer-4 matching,
+        which the assignment's MAC-pair policy format does not express.
   \item \textbf{No policy verification.} The firewall could statically check
         a generated policy for contradictions or unreachable rules before
         accepting it.
@@ -849,7 +909,7 @@ the target and rebuilding fixed it.
 All commands run from the repository root.
 
 \begin{lstlisting}[style=sdnconsole]
-# 1. Offline tests (no network required) -- 48 tests
+# 1. Offline tests (no network required) -- 51 tests
 .venv/bin/python -m pytest tests/ -v
 
 # 2. LLM policy generation
@@ -888,9 +948,9 @@ bash report/build.sh
 \code{topo2.py}                & Four-host Mininet topology (\code{PythonSwitch}) \\
 \code{firewall\_rules.rules}   & Policy, generated by the LLM (JSON) \\
 \code{intent\_to\_policy.py}   & LLM intent $\rightarrow$ policy (Part 2) \\
-\code{tests/test\_firewall.py} & Firewall logic, offline (7 tests) \\
+\code{tests/test\_firewall.py} & Firewall logic, offline (11 tests) \\
 \code{tests/test\_oswitch\_wire.py} & OpenFlow wire format vs POX (9 tests) \\
-\code{tests/test\_intent\_to\_policy.py} & LLM output handling (32 tests) \\
+\code{tests/test\_intent\_to\_policy.py} & LLM output handling (31 tests) \\
 \code{run\_e2e.sh}             & Brings up the full stack in a user namespace \\
 \code{report/mininet\_cli.txt} & Scripted Mininet CLI checks for \code{--batch} \\
 \code{report/bench\_models.py} & Model comparison behind the Part 2 choice \\
