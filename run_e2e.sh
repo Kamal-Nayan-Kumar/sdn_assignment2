@@ -27,6 +27,9 @@ fi
 
 mkdir -p "$ROOT/logs"
 
+# pox/ext/ is inside a nested upstream checkout, so put our app in place.
+bash "$ROOT/install_firewall_app.sh"
+
 pkill -f pox.py 2>/dev/null
 pkill -f oswitch.py 2>/dev/null
 sleep 1

@@ -17,6 +17,12 @@ dist/
 pox/
 mininet/
 
+# ...but OUR firewall app lives inside the POX tree, because pox/boot.py adds
+# pox/ext to sys.path itself (the module must be named `firewall`, not
+# `pox.ext.firewall`).  It is a deliverable, so it is tracked even though the
+# directory containing it is ignored.
+!pox/ext/firewall.py
+
 # Editor / OS noise
 .DS_Store
 *.swp

@@ -10,14 +10,24 @@ Run from the repository root:
     .venv/bin/python -m pytest tests/test_firewall.py -v
 """
 
+import shutil
 import sys
 from pathlib import Path
 
-# Make the POX tree importable: <repo>/pox contains the `pox`
-# package and the `ext` package (with our firewall app).
+# Make the POX tree importable: <repo>/pox contains the `pox` package.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POX_ROOT = REPO_ROOT / "pox"
 sys.path.insert(0, str(POX_ROOT))
+
+# The firewall app is tracked at app/firewall.py and copied into pox/ext/ by
+# install_firewall_app.sh (upstream POX's own .gitignore contains `ext/*`, so
+# pox/ext/ cannot be tracked).  If it has not been installed yet, put it in
+# place here so the tests run straight from a fresh clone.
+_APP_SRC = REPO_ROOT / "app" / "firewall.py"
+_APP_DST = POX_ROOT / "ext" / "firewall.py"
+if _APP_SRC.exists() and not _APP_DST.exists():
+    _APP_DST.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(str(_APP_SRC), str(_APP_DST))
 
 from pox.core import core                                  # noqa: E402
 from pox.lib.revent import EventMixin                      # noqa: E402
