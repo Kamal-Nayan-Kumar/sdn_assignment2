@@ -52,8 +52,18 @@ OFPT_STATS_REPLY = 17
 OFPT_BARRIER_REQUEST = 18
 OFPT_BARRIER_REPLY = 19
 
-# OFPST_DESC descriptor block: 4x256-byte strings + 32-byte serial.
-DESC_LEN = 4 * 256 + 32
+# OFPST_DESC descriptor block: 4x256-byte strings + 32-byte serial number.
+# Each field is fixed-width and NUL-padded.
+DESC_STR_LEN = 256
+SERIAL_NUM_LEN = 32
+DESC_FIELD_LENS = (DESC_STR_LEN, DESC_STR_LEN, DESC_STR_LEN,
+                   SERIAL_NUM_LEN, DESC_STR_LEN)
+DESC_LEN = sum(DESC_FIELD_LENS)          # 1056
+
+# Fixed-size / advertised-switch constants.
+OFP_MAX_NAME = 16          # ofp_phy_port.name field width
+OFPPS_LINK_DOWN = 1 << 0   # port state bit
+OFP_NO_BUFFER = 256        # n_buffers advertised in FEATURES_REPLY
 
 OFPFC_ADD = 0
 OFPFC_MODIFY = 1
@@ -64,29 +74,60 @@ OFPP_FLOOD = 0xfffb
 OFPP_ALL = 0xfffc
 OFPP_CONTROLLER = 0xfffd
 
-# Match structure (40 bytes):
+# Match structure (40 bytes), OpenFlow 1.0 ofp_match:
 #   wildcards(4) in_port(2) dl_src(6) dl_dst(6) dl_vlan(2) dl_vlan_pcp(1)
 #   pad(1) dl_type(2) nw_tos(1) nw_proto(1) pad(2) nw_src(4) nw_dst(4)
 #   tp_src(2) tp_dst(2)
-#   tp_src(2) tp_dst(2)
-# The match field carries two alignment pads (after dl_vlan_pcp and after
-# nw_proto), giving the full 40-byte ofp_match that POX packs.
+# The match carries two alignment pads (after dl_vlan_pcp and after nw_proto),
+# giving the full 40-byte ofp_match that POX packs/unpacks.
 OFP_MATCH_FMT = '!IH6s6sHBxHBB2xIIHH'
-OFP_MATCH_SZ = struct.calcsize(OFP_MATCH_FMT)
+OFP_MATCH_SZ = struct.calcsize(OFP_MATCH_FMT)   # 40
 
-# FLOW_MOD command section that follows the match:
+# Wildcard bits (ofp_match.wildcards).
+#
+# CAUTION: these are POX's values, which for OFPFW_DL_TYPE (16) diverge from
+# the OpenFlow 1.0 spec text (0x1000).  POX is the only controller this switch
+# has to interoperate with, so we follow POX rather than the spec; mixing the
+# two silently turns every match into a wildcard.
+OFPFW_IN_PORT = 0x0001
+OFPFW_DL_VLAN = 0x0002
+OFPFW_DL_SRC = 0x0004
+OFPFW_DL_DST = 0x0008
+OFPFW_DL_TYPE = 0x0010
+
+# FLOW_MOD command section that follows the 40-byte match:
 #   cookie(8) command(2) idle_timeout(2) hard_timeout(2) priority(2)
 #   buffer_id(4) out_port(2) flags(2) = 24 bytes
+# NOTE: cookie is 8 bytes (Q). The earlier `I` packing silently shifted every
+# following field and is the reason POX raised AssertionError in _readzs().
 OFP_FLOW_MOD_FMT = '!QHHHHLHH'
-OFP_FLOW_MOD_SZ = struct.calcsize(OFP_FLOW_MOD_FMT)
+OFP_FLOW_MOD_SZ = struct.calcsize(OFP_FLOW_MOD_FMT)   # 24
 
-# Flow mod body after 8-byte header:
-#   match(40) cookie(8) command(2) idle(2) hard(2) priority(2)
-#   buffer_id(4) out_port(2) flags(2)
-OFP_FLOW_MOD_BODY_FMT = '!40sIHHHHHIHH'
+# PHY_PORT entry inside FEATURES_REPLY (48 bytes):
+#   port_no(2) hw_addr(6) name(16) config(4) state(4) curr(4)
+#   advertised(4) supported(4) peer(4)
+OFP_PHY_PORT_FMT = '!H6s16sIIIIII'
+OFP_PHY_PORT_SZ = struct.calcsize(OFP_PHY_PORT_FMT)   # 48
+
+# PACKET_OUT: buffer_id(4) in_port(2) actions_len(2)
+OFP_PACKET_OUT_FMT = '!IHH'
+OFP_PACKET_OUT_SZ = struct.calcsize(OFP_PACKET_OUT_FMT)   # 8
+
+# PACKET_IN: buffer_id(4) total_len(2) in_port(2) reason(1) pad(1)
+OFP_PACKET_IN_FMT = '!IHHBB'
+OFP_PACKET_IN_SZ = struct.calcsize(OFP_PACKET_IN_FMT)   # 12
 
 # Action output: type(2) len(2) port(2) max_len(2)
 OFP_ACTION_OUTPUT_FMT = '!HHHH'
+
+# OFPST_* stats types (subset we need).
+OFPST_DESC = 0
+OFPST_FLOW = 1
+
+
+def mac_str(raw):
+    """Format a 6-byte MAC for logging."""
+    return ':'.join('%02x' % b for b in raw)
 
 
 class FlowEntry:
@@ -98,16 +139,30 @@ class FlowEntry:
         self.priority = priority
         self.cookie = cookie
 
-    def matches(self, in_port, frame):
-        """Check if a frame matches this flow entry."""
+    def __repr__(self):
         m = self.match
-        if m['in_port'] and m['in_port'] != in_port:
+        return ('FlowEntry(prio=%d in_port=%s dl_src=%s dl_dst=%s -> %s)'
+                % (self.priority, m['in_port'] or '*',
+                   mac_str(m['dl_src']), mac_str(m['dl_dst']), self.actions))
+
+    def matches(self, in_port, frame):
+        """Check if a frame matches this flow entry.
+
+        A field is only compared when the controller did not wildcard it
+        (OpenFlow 1.0 ofp_match semantics).
+        """
+        m = self.match
+        wc = m['wildcards']
+        if not wc & OFPFW_IN_PORT and m['in_port'] and m['in_port'] != in_port:
             return False
-        if m['dl_src'] != b'\x00' * 6 and m['dl_src'] != frame[6:12]:
+        if not wc & OFPFW_DL_SRC and m['dl_src'] != b'\x00' * 6 \
+                and m['dl_src'] != frame[6:12]:
             return False
-        if m['dl_dst'] != b'\x00' * 6 and m['dl_dst'] != frame[0:6]:
+        if not wc & OFPFW_DL_DST and m['dl_dst'] != b'\x00' * 6 \
+                and m['dl_dst'] != frame[0:6]:
             return False
-        if m['dl_type'] and m['dl_type'] != struct.unpack('!H', frame[12:14])[0]:
+        if not wc & OFPFW_DL_TYPE and m['dl_type'] \
+                and m['dl_type'] != struct.unpack('!H', frame[12:14])[0]:
             return False
         return True
 
@@ -127,11 +182,31 @@ class OFSwitch:
         self.dead_ports = set()  # ports whose socket errored out
         self.ctrl = None
 
+        # Switch capabilities advertised in FEATURES_REPLY.
+        self.n_buffers = OFP_NO_BUFFER
+        self.n_tables = 1
+        self.capabilities = 0
+        self.actions = 0
+
+        # Identity reported through OFPST_DESC stats.
+        self.mfr_desc = 'SDN Assignment 2'
+        self.hw_desc = 'None (pure software switch)'
+        self.sw_desc = 'oswitch.py 1.0'
+        self.serial_num = '0000000001'
+        self.dp_desc = str(dpid)
+
         for port_num, iface in ports:
             self.ports[port_num] = iface
 
     def log(self, msg):
         print('[oswitch] %s' % msg, flush=True)
+
+    def dump_flows(self):
+        """Log the whole flow table (used as evidence in the report)."""
+        self.log('--- flow table (%d entries) ---' % len(self.flow_table))
+        for i, f in enumerate(sorted(self.flow_table,
+                                     key=lambda e: -e.priority)):
+            self.log('  %2d: %s' % (i, f))
 
     def connect(self):
         """Connect to the controller and send HELLO."""
@@ -180,32 +255,46 @@ class OFSwitch:
         self.ctrl.send(header + data)
 
     def handle_features_request(self, xid):
-        """Reply to FEATURES_REQUEST with FEATURES_REPLY."""
-        # OpenFlow 1.0 FEATURES_REPLY body (fixed 24-byte header):
-        #   datapath_id(8) n_buffers(4) n_tables(1) pad(3) capabilities(4) actions(4)
-        # n_buffers is 4 bytes (L), not 1 byte (B).
-        body = struct.pack('!QLB3sII', self.dpid, 255, 1, b'\x00' * 3, 0, 0)
+        """Reply to FEATURES_REQUEST with FEATURES_REPLY.
+
+        OpenFlow 1.0 ofp_switch_features (24-byte fixed header):
+            datapath_id(8) n_buffers(4) n_tables(1) pad(3)
+            capabilities(4) actions(4)
+        followed by n_ports ofp_phy_port (48 bytes each).  n_buffers is a
+        4-byte field (L) -- packing it as one byte (B) makes the body 21
+        bytes and POX's ofp_switch_features.unpack() raises AssertionError.
+        """
+        body = struct.pack('!QLB3xII', self.dpid, self.n_buffers,
+                           self.n_tables, self.capabilities, self.actions)
         for port_num in sorted(self.ports.keys()):
             iface = self.ports[port_num]
-            # OpenFlow 1.0 phy_port: port_no(2) hw_addr(6) name(16)
-            #   config(4) state(4) curr(4) advertised(4) supported(4) peer(4) = 48 bytes
-            port_desc = struct.pack('!H', port_num)
-            port_desc += b'\x00' * 6
-            # Name field: 16 bytes, null-terminated, zero-padded
-            name_bytes = iface.encode()[:15] + b'\x00'
-            port_desc += name_bytes.ljust(16, b'\x00')
-            port_desc += struct.pack('!IIIIII', 0, 0, 0, 0, 0, 0)
+            # ofp_phy_port: port_no(2) hw_addr(6) name(16)
+            #   config(4) state(4) curr(4) advertised(4) supported(4) peer(4)
+            name_bytes = iface.encode()[:OFP_MAX_NAME - 1] + b'\x00'
+            port_desc = struct.pack(OFP_PHY_PORT_FMT, port_num,
+                                    b'\x00' * 6,
+                                    name_bytes.ljust(OFP_MAX_NAME, b'\x00'),
+                                    0, OFPPS_LINK_DOWN, OFPPS_LINK_DOWN,
+                                    0, 0, 0)
             body += port_desc
         length = 8 + len(body)
         header = struct.pack('!BBHI', OFP_VERSION, OFPT_FEATURES_REPLY, length, xid)
         self.ctrl.send(header + body)
 
     def handle_flow_mod(self, data):
-        """Handle FLOW_MOD from controller."""
-        match_data = data[:OFP_MATCH_SZ]
+        """Handle FLOW_MOD from controller.
+
+        Body layout: ofp_match(40) then the 24-byte command section
+        (cookie 8, command 2, idle 2, hard 2, priority 2, buffer_id 4,
+        out_port 2, flags 2), then the action list.
+        """
+        if len(data) < OFP_MATCH_SZ + OFP_FLOW_MOD_SZ:
+            self.log('FLOW_MOD too short (%d bytes), ignoring' % len(data))
+            return
+
         (wildcards, in_port, dl_src, dl_dst, dl_vlan, dl_vlan_pcp,
          dl_type, nw_tos, nw_proto, nw_src, nw_dst, tp_src, tp_dst) = \
-            struct.unpack(OFP_MATCH_FMT, match_data)
+            struct.unpack(OFP_MATCH_FMT, data[:OFP_MATCH_SZ])
 
         (cookie, command, idle_timeout, hard_timeout, priority,
          buffer_id, out_port, flags) = \
@@ -213,7 +302,8 @@ class OFSwitch:
                           data[OFP_MATCH_SZ:OFP_MATCH_SZ + OFP_FLOW_MOD_SZ])
 
         match = {
-            'in_port': in_port, 'dl_src': dl_src, 'dl_dst': dl_dst,
+            'wildcards': wildcards, 'in_port': in_port,
+            'dl_src': dl_src, 'dl_dst': dl_dst,
             'dl_vlan': dl_vlan, 'dl_type': dl_type,
             'nw_src': nw_src, 'nw_dst': nw_dst,
             'tp_src': tp_src, 'tp_dst': tp_dst,
@@ -233,7 +323,8 @@ class OFSwitch:
             self.flow_table = [f for f in self.flow_table
                                if not (f.match == match and f.priority == priority)]
             self.flow_table.append(FlowEntry(match, actions, priority, cookie))
-            self.log('Installed flow: %s -> %s prio=%d' % (dl_src.hex(), dl_dst.hex(), priority))
+            self.log('Installed flow: %s -> %s prio=%d cookie=0x%016x'
+                     % (mac_str(dl_src), mac_str(dl_dst), priority, cookie))
         elif command == OFPFC_DELETE:
             self.flow_table = [f for f in self.flow_table
                                if not (f.match == match and f.priority == priority)]
@@ -311,17 +402,36 @@ class OFSwitch:
     def handle_stats_request(self, xid, data):
         """Reply to STATS_REQUEST with a STATS_REPLY.
 
-        OFPT_STATS_REPLY for OFPST_DESC must echo the 1056-byte
-        manufacturer/hardware/software/serial/datapath descriptor block
-        ahead of the 4-byte stats header, or POX raises UnderrunError.
+        OpenFlow 1.0 ofp_stats_reply is:
+            header(8) type(2) flags(2) body(...)
+
+        The 4-byte type/flags field comes *before* the body -- putting the
+        descriptor block ahead of it only ever parsed by accident (the
+        descriptor is all zero bytes, so POX read type=0/flags=0).  For
+        OFPST_DESC the body is a 1056-byte descriptor block
+        (4x256-byte strings + a 32-byte serial number); every other stats
+        type we support has an empty (zero-entry) reply body.
         """
-        # The request body carries the stats type followed by the desc block.
-        desc = data[4:] if len(data) >= 4 else b''
-        if len(desc) < DESC_LEN:
-            desc = desc.ljust(DESC_LEN, b'\x00')
-        body = desc[:DESC_LEN] + struct.pack('!HH', 0, 0)
-        length = 8 + len(body)
-        header = struct.pack('!BBHI', OFP_VERSION, OFPT_STATS_REPLY, length, xid)
+        stats_type = struct.unpack('!H', data[:2])[0] if len(data) >= 2 else OFPST_DESC
+
+        if stats_type == OFPST_DESC:
+            # The descriptor block is five *fixed-width* fields, not one
+            # concatenated blob: 4x256-byte strings plus a 32-byte serial.
+            desc = (self.mfr_desc.encode()[:DESC_STR_LEN],
+                    self.hw_desc.encode()[:DESC_STR_LEN],
+                    self.sw_desc.encode()[:DESC_STR_LEN],
+                    self.serial_num.encode()[:SERIAL_NUM_LEN],
+                    self.dp_desc.encode()[:DESC_STR_LEN])
+            body = b''.join(f.ljust(n, b'\x00')
+                            for f, n in zip(desc, DESC_FIELD_LENS))
+        else:
+            # Empty reply: no matching entries.  POX parses this as an
+            # empty list and reports "no flows", which is honest for a
+            # minimal switch.
+            body = b''
+
+        header = struct.pack('!BBHIHH', OFP_VERSION, OFPT_STATS_REPLY,
+                             12 + len(body), xid, stats_type, 0)
         self.ctrl.send(header + body)
 
     def handle_barrier_request(self, xid):
@@ -362,6 +472,9 @@ class OFSwitch:
         self.connect()
         self.open_ports()
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        # SIGUSR1 dumps the flow table -- handy for grabbing evidence while
+        # the network is live.
+        signal.signal(signal.SIGUSR1, lambda *_: self.dump_flows())
 
         while True:
             try:

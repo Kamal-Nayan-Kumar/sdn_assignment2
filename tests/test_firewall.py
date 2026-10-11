@@ -108,6 +108,15 @@ def test_policy_file_loads():
   assert not fw.is_blocked(H3, H1)      # rules are directional
 
 
+def test_policy_file_loads_json_format():
+  """The live policy file on disk (LLM output) must load too."""
+  live = REPO_ROOT / "firewall_rules.rules"
+  rules = firewall.load_policy(str(live))
+  assert len(rules) == 2
+  assert firewall.FirewallRule(H1, H3, "DROP") in rules
+  assert firewall.FirewallRule(H2, H4, "DROP") in rules
+
+
 def test_json_policy_loads():
   import json, tempfile, os
   llm_output = json.dumps([

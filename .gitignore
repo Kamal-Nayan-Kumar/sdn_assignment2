@@ -22,3 +22,18 @@ mininet/
 *.swp
 .idea/
 .vscode/
+
+# Report intermediates (captured transcripts; regenerate with report/capture.sh)
+report/.logs/
+report/figs/*.slice.ansi
+
+# Runtime logs
+logs/
+
+# LaTeX build intermediates
+report/report.aux
+report/report.log
+report/report.out
+report/*.synctex.gz
+report/report.fls
+report/report.fdb_latexmk
