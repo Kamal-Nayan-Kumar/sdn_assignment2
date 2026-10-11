@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Build the assignment submission bundle.
 #
-# Produces a single archive containing:
-#   report.pdf            the report (single PDF, all explanations + figures)
-#   report/report.tex     its LaTeX source
-#   report/figs/*.png     every screenshot
-#   app/, pox/ext/...     the firewall application
-#   oswitch.py, topo2.py, intent_to_policy.py, run_e2e.sh, ...
-#   tests/                the test suite
-#   the source assignment PDF, for reference
+# Layout requested for submission:
 #
-# Deliberately excluded: the vendored pox/ and mininet/ checkouts (they are
-# third-party and enormous), .venv/, .git/, runtime logs, and build noise.
+#   sdn_assignment2_submission.zip
+#   ├── report.pdf            the report (single PDF: all explanation +
+#   │                         screenshots) -- the headline artefact
+#   └── code/                 everything else: source, tests, scripts,
+#                             the policy file, figures and LaTeX source
+#
+# The vendored pox/ and mininet/ trees are third-party (cloned separately)
+# and are excluded, as are .venv/, .git/ and runtime logs.
 #
 # Usage: bash make_submission.sh [output.zip]
 set -eu
@@ -23,15 +22,49 @@ STAGE=$(mktemp -d /tmp/opencode/submission.XXXXXX)
 
 echo "[submit] staging in $STAGE"
 
-# --- make sure the app is installed where POX expects it ----------------
+# The app must be in place before anything reads it.
 bash "$ROOT/install_firewall_app.sh"
 
 # ------------------------------------------------------------------ #
-# Files that make up the deliverable                                #
+# 1. The report, at the top level                                    #
 # ------------------------------------------------------------------ #
-FILES=(
-  # --- report (the single PDF is the headline artefact) -------------
-  report/report.pdf
+if [ -f "$ROOT/report/report.pdf" ]; then
+  cp "$ROOT/report/report.pdf" "$STAGE/report.pdf"
+  echo "[submit] report.pdf"
+else
+  echo "[submit] FATAL: report/report.pdf missing -- build it first:" >&2
+  echo "        bash report/build.sh" >&2
+  rm -rf "$STAGE"
+  exit 1
+fi
+
+# ------------------------------------------------------------------ #
+# 2. Everything else, under code/                                    #
+# ------------------------------------------------------------------ #
+CODE="$STAGE/code"
+mkdir -p "$CODE"
+
+COPY=(
+  # ---- this assignment's source ------------------------------------
+  app/firewall.py
+  pox/ext/firewall.py
+  oswitch.py
+  topo2.py
+  intent_to_policy.py
+  firewall_rules.rules
+
+  # ---- scripts ------------------------------------------------------
+  run_e2e.sh
+  install_firewall_app.sh
+  run_all.sh
+  shim/ifconfig
+
+  # ---- tests --------------------------------------------------------
+  tests/test_firewall.py
+  tests/test_oswitch_wire.py
+  tests/test_intent_to_policy.py
+
+  # ---- report source and evidence (the PDF itself is at the top) ----
   report/report.tex
   report/FIGURES.md
   report/mininet_cli.txt
@@ -45,135 +78,71 @@ FILES=(
   report/logo.jpeg
   report/model_benchmark.json
 
-  # --- source code ---------------------------------------------------
-  app/firewall.py
-  pox/ext/firewall.py
-  oswitch.py
-  topo2.py
-  intent_to_policy.py
-  run_e2e.sh
-  install_firewall_app.sh
-  run_demo.py
-  shim/ifconfig
-
-  # --- tests ---------------------------------------------------------
-  tests/test_firewall.py
-  tests/test_oswitch_wire.py
-  tests/test_intent_to_policy.py
-
-  # --- policy and config ---------------------------------------------
+  # ---- docs ---------------------------------------------------------
   README.md
   COMMAND.md
-  firewall_rules.rules
   mise.toml
   .gitignore
 
-  # --- the assignment statement itself -------------------------------
+  # ---- the assignment statement ------------------------------------
   "SDN_Assignment2 2026.pdf"
 )
 
-for f in "${FILES[@]}"; do
+for f in "${COPY[@]}"; do
   if [ -e "$ROOT/$f" ]; then
-    mkdir -p "$STAGE/$(dirname "$f")"
-    cp "$ROOT/$f" "$STAGE/$f"
+    mkdir -p "$CODE/$(dirname "$f")"
+    cp "$ROOT/$f" "$CODE/$f"
   else
-    # run_demo.py was dropped in an earlier commit; that is fine.
-    [ "$f" = "run_demo.py" ] && continue
     echo "[submit] WARNING: missing $f" >&2
   fi
 done
 
-# figures
-mkdir -p "$STAGE/report/figs"
+# figures -> code/report/figs/
+mkdir -p "$CODE/report/figs"
 for png in "$ROOT"/report/figs/*.png; do
-  [ -e "$png" ] && cp "$png" "$STAGE/report/figs/"
+  [ -e "$png" ] && cp "$png" "$CODE/report/figs/"
 done
 
 # ------------------------------------------------------------------ #
-# README: how to run it                                              #
+# 3. A root-level note, since run_all.sh lives in code/              #
 # ------------------------------------------------------------------ #
-cat > "$STAGE/run_all.sh" <<'EOF'
-#!/usr/bin/env bash
-# Run every check in the submission, in order.
-#   usage: bash run_all.sh [--no-e2e]
-set -eu
-cd "$(dirname "$0")"
+cat > "$STAGE/HOW_TO_RUN.md" <<'EOF'
+# SDN Assignment 2
 
-PY=python3
-[ -x .venv/bin/python ] && PY=.venv/bin/python
+**`report.pdf`** — the report: architecture, implementation details,
+environment setup, known limitations, results, and all screenshots.
+Read this first.
 
-# The vendored POX and Mininet checkouts are third-party and are not shipped
-# in this bundle.  Everything that needs them (the offline tests import POX to
-# verify the OpenFlow wire format) will report a clear message here instead of
-# an import traceback.
-if [ ! -f pox/pox.py ]; then
-  cat <<MSG
-==========================================
- Missing third-party dependencies
-==========================================
-This bundle contains ONLY this assignment's code: the app, switch, topology,
-LLM policy generator and tests.  To actually RUN the tests or the network you
-also need the two checkouts this project builds on:
+**`code/`** — everything needed to reproduce the results. See
+`code/COMMAND.md` for the full command list and `code/README.md` for an
+overview.
 
-  git clone https://github.com/noxrepo/pox.git pox
-  git clone https://github.com/mininet/mininet.git mininet
-  make -C mininet
+Quick start, from inside `code/`:
 
-Then, from this directory:
+```bash
+python3 -m pytest tests/ -q        # 51 offline tests, ~1s, no network
+unshare -Urn bash run_e2e.sh --batch   # full end-to-end: 33% dropped
+```
 
-  bash install_firewall_app.sh     # put app/firewall.py where POX wants it
-  python3 -m pytest tests/ -q      # 51 tests
-  unshare -Urn bash run_e2e.sh --batch
-
-Nothing needs the network to READ the report: report/report.pdf has the
-architecture, implementation, environment, limitations and results.
-MSG
-  exit 2
-fi
-
-echo "=========================================="
-echo "1/4  Offline test suite"
-echo "=========================================="
-$PY -m pytest tests/ -q
-
-echo
-echo "=========================================="
-echo "2/4  Policy file and the rules POX loads"
-echo "=========================================="
-cat firewall_rules.rules
-
-if [ "${1:-}" != "--no-e2e" ]; then
-  echo
-  echo "=========================================="
-  echo "3/4  End-to-end: POX + oswitch + Mininet"
-  echo "=========================================="
-  # Needs unshare for the user namespace; may need ./install_firewall_app.sh
-  # first if pox/ is a fresh checkout.
-  if unshare -Urn true 2>/dev/null; then
-    unshare -Urn bash run_e2e.sh --batch
-  else
-    echo "  (skipped: unshare unavailable on this host)"
-    bash run_e2e.sh --batch
-  fi
-fi
-
-echo
-echo "=========================================="
-echo "4/4  Done. Report: report/report.pdf"
-echo "=========================================="
+`run_all.sh` runs both in sequence and prints what it did.
 EOF
-chmod +x "$STAGE/run_all.sh"
+
+# Make the scripts runnable in the bundle.
+chmod +x "$CODE"/*.sh "$CODE"/tests/*.sh 2>/dev/null || true
 
 # ------------------------------------------------------------------ #
-# Zip it                                                             #
+# 4. Zip it                                                          #
 # ------------------------------------------------------------------ #
 rm -f "$OUT"
 (cd "$STAGE" && zip -qr "$OUT" .)
+
 echo
-echo "[submit] wrote $OUT"
-ls -lh "$OUT"
+echo "[submit] wrote $OUT ($(du -h "$OUT" | cut -f1))"
 echo
-echo "[submit] contents:"
-(cd "$STAGE" && unzip -l "$OUT" | tail -n +4 | head -n -2 | awk '{
-  print $4"  "$1}')
+echo "[submit] top level:"
+(cd "$STAGE" && unzip -l "$OUT" | awk 'NR>3 && $4 !~ /\// {printf "  %s  %s\n", $1, $4}' | grep -v "^  *$" | grep -v "^-" )
+echo
+echo "[submit] under code/:"
+(cd "$STAGE" && unzip -l "$OUT" | awk -v p="code/" 'index($4,p)==1 {printf "  %s  %s\n", $1, $4}')
+
 rm -rf "$STAGE"
